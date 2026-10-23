@@ -1,0 +1,1909 @@
+; SoTe Packer 2.2 (fast depacker), 20 June 1994 as embedded in binary.
+; Original algorithm/code credited in XEX to Soused Teat / Slight.
+; Reconstruction based on Seban's historical blk1.xsm; analysis: 2026-10-06.
+; This file reassembles BYTE-FOR-BYTE to bin/sote_packer.xex.
+; Only binary change relative to historical blk1.xsm: $2015=$06 (was $86).
+; Seban clarified 2026-10-06: $86 intentionally marked his RE build visually.
+; It was not a reconstruction error; $06 here preserves original binary parity.
+; Historical bugs remain in the code. See docs/FINDINGS.md and docs/FORMAT.md.
+; Build: xasm src/sote_packer.xsm -o build/sote_packer.xex
+; Instruction comments retain Seban's historical notes where confirmed,
+; with corrections/additions from the binary audit; procedure blocks add context.
+; Comments describe observed behavior; author intentions are hypotheses in MD.
+; Layout: hard TABs, tab width 8; label/opcode/operand/comment columns 1/25/33/57.
+
+
+			opt	h+
+
+; ----------------------------------------------------------------------------
+; ROM XL/XE: direct internal OS entry points, not stable jump-table vectors.
+; CIO below uses the public vector $E456. Exact ROM compatibility is separate
+; from CPU-only verification. The packer never banks out the OS or BASIC.
+
+OS_GTIA_BELL		equ	$F556
+OS_GET_KEY		equ	$F2FD
+OS_GET_KEY_IGN		equ	$F2F8
+
+; ----------------------------------------------------------------------------
+; ZERO-PAGE ALIASES, grouped by context. Every EQU names a physical address.
+; A word uses that byte and byte+1. EQU does not allocate or preserve memory.
+; (variable reused) marks overlapping storage, including partial word overlap.
+; These are analysis names, not recovered author symbols. See docs/FINDINGS.md.
+
+; ----------------------------------------------------------------------------
+; FILE/SCREEN HELPERS. file_name_ptr is used by OPEN to inspect device name.
+; text_ptr is used by formatting and prompt routines. Neither saves old ZP.
+; Calling them while overlapping packer state is live would overwrite it.
+
+file_name_ptr		equ	$80			; 2 bytes (variable reused), CIO_open_ch1
+text_ptr		equ	$89			; 2 bytes (variable reused), formatting / msg_print_Z
+
+; ----------------------------------------------------------------------------
+; INPUT PREPARATION. input_end_ptr is exclusive true end; padding_ptr walks
+; two pages from it and then returns to the original end. They are aliases.
+
+input_end_ptr		equ	$8D			; 2 bytes (variable reused)
+padding_ptr		equ	$8D			; 2 bytes (variable reused), zero-fill cursor
+
+; ----------------------------------------------------------------------------
+; PASS 1: match search and continuous bit writer.
+; pack_match_length=0 means literal; emitted matches have length 2..255.
+; pack_limit_end replaces input_end_ptr after its high byte is incremented.
+; pack_field_bits MUST survive calls using pack_io_saved_x: $85 != $86.
+
+pack_match_length	equ	$80			; 1 byte (variable reused), current best length
+pack_bit_buffer		equ	$81			; 1 byte (variable reused), accumulated output bits
+pack_free_bits		equ	$82			; 1 byte (variable reused), free positions 8..1
+pack_io_saved_y		equ	$83			; 1 byte (variable reused), preserve Y around output CIO
+pack_io_saved_a		equ	$84			; 1 byte (variable reused), preserve shifted A
+pack_field_bits		equ	$85			; 1 byte (variable reused), requested put_xbits count
+pack_io_saved_x		equ	$86			; 1 byte, preserve current bit-loop X
+pack_unused_init	equ	$87			; 1 byte, only initialized, never read
+pack_src_ptr		equ	$89			; 2 bytes (variable reused), current input position
+pack_candidate_ptr	equ	$8B			; 2 bytes (variable reused), candidate in search window
+pack_limit_end		equ	$8D			; 2 bytes (variable reused), exclusive input end + 256
+pack_offset_bits	equ	$8F			; 1 byte (variable reused), k=0..5
+pack_written_bytes	equ	$90			; 2 bytes (variable reused), full pass-1 bytes emitted
+pack_progress_work	equ	$92			; 2 bytes, display arithmetic scratch
+pack_src_saved_unused	equ	$94			; 2 bytes, written at setup, never read
+pack_input_length	equ	$96			; 2 bytes, true input length for progress
+pack_match_address	equ	$98			; 2 bytes (variable reused), selected candidate address
+pack_match_distance	equ	$98			; 2 bytes (variable reused), SAME word after src-address
+
+; ----------------------------------------------------------------------------
+; BETWEEN PASSES/UI. packed_block_size=pass1_bytes+4; +4 accounts for
+; destination and true-length words. Pass 2 replaces it with an end address.
+; blk_adr_tab+6 retains the original size and later includes the stub.
+
+packed_block_size	equ	$9C			; 2 bytes (variable reused), count used for UI/XEX setup
+
+; ----------------------------------------------------------------------------
+; PASS 2: same bytes acquire separate input-bit/output-cursor roles.
+; pass2_bit_buffer holds a sentinel, while pass2_bit_mask is an output mask.
+; get_xbit and dst_put_offset reuse $9E but do not nest into each other.
+
+pass2_io_saved_y	equ	$83			; 1 byte (variable reused), input reader CIO save
+pass2_io_saved_a	equ	$84			; 1 byte (variable reused), input reader accumulator save
+pass2_dst_ptr		equ	$89			; 2 bytes (variable reused), output cursor
+pass2_offset_bits	equ	$8F			; 1 byte (variable reused), k read back from intermediate file
+pass2_end_ptr		equ	$9C			; 2 bytes (variable reused), exclusive $2B00+block_size
+pass2_io_saved_x	equ	$9E			; 1 byte (variable reused), input reader CIO save
+pass2_offset_saved_x	equ	$9E			; 1 byte (variable reused), dst_put_offset caller's X
+pass2_bit_mask		equ	$A0			; 1 byte, $80..$01 then 0
+pass2_bit_buffer	equ	$A2			; 1 byte, input bits + sentinel
+
+; ----------------------------------------------------------------------------
+; ADDRESS EDITOR. ui_field_zp is the ZP INDEX of the edited word, not its
+; value. ui_range_end and ui_hex_value deliberately alias: the previous end
+; is dead before conversion. ui_result_end survives for save_as_file's use.
+; CLOBBERS $85,$89-$8E,$90/$91 and normal print/input helper registers.
+
+ui_field_zp		equ	$85			; 1 byte (variable reused), address of edited ZP word
+ui_range_end		equ	$8B			; 2 bytes (variable reused), address+length then minus one
+ui_hex_value		equ	$8B			; 2 bytes (variable reused), hexadecimal conversion accumulator
+ui_result_end		equ	$8D			; 2 bytes (variable reused), inclusive displayed range end
+ui_range_length		equ	$90			; 2 bytes (variable reused), length of displayed range
+
+; ----------------------------------------------------------------------------
+; LONG-LIVED UI PARAMETERS. Kept outside the helpers' phase-local scratch.
+; cfg_flags is historically NOT initialized. After TWO answers bit6=XEX,
+; bit7=include depacker; after only N, bit6 comes from stale old bit7.
+
+true_input_length	equ	$A3			; 2 bytes, actual CIO count / fast header n
+cfg_flags		equ	$A5			; 1 byte, historical stale-header bug
+data_adr		equ	$A6			; 2 bytes, packed-stream runtime address
+depa_adr		equ	$A8			; 2 bytes, unpack destination
+init_seg_addr		equ	$AA			; 2 bytes, location OF vector, default INITAD
+init_seg_size		equ	$AC			; 2 bytes, displayed vector length (2)
+post_depack_jump	equ	$AE			; 2 bytes, optional final JMP target
+run_addr_size		equ	$B0			; 2 bytes, displayed jump range length (1)
+
+; ----------------------------------------------------------------------------
+; EXPORTED DEPACKER. Runs as a separate payload, not during match search.
+; $80/$81 is ONE pointer, overlapping two byte variables from the packer.
+; dpck_match_distance becomes dpck_match_ptr in place after subtraction.
+; CLOBBERS $80-$84 and A/X/Y/flags; requires D=0 and writable code.
+
+dpck_dst_ptr		equ	$80			; 2 bytes (variable reused), output cursor
+dpck_match_distance	equ	$82			; 2 bytes (variable reused), distance read from stream
+dpck_match_ptr		equ	$82			; 2 bytes (variable reused), same word after dst-distance
+dpck_bit_buffer		equ	$84			; 1 byte (variable reused), bits + sentinel
+
+; ----------------------------------------------------------------------------
+; RELOCATION. Runtime destination differs from the staging buffer address.
+; Delta = runtime_address - $2911, modulo 65536. CLOBBERS $F0-$F7.
+
+rel_src_ptr		equ	$F0			; 2 bytes, original template cursor
+rel_dst_ptr		equ	$F2			; 2 bytes, staging copy cursor
+rel_adr_dif		equ	$F4			; 2 bytes, relocation delta
+rel_runtime_addr	equ	$F6			; 2 bytes, eventual execution address
+
+; ----------------------------------------------------------------------------
+; cmd_line accepts up to 40 bytes, but cmd_line_swap preserves only 32.
+; Data buffer read request is $9000 bytes: $2B00..$BAFF. Subsequent 512-byte
+; zero fill, expansion and appended stub are NOT covered by a bounds check.
+
+cmd_line		equ	$0400
+data_buffer		equ	$2b00
+data_buffer_len		equ	$9000
+
+; ----------------------------------------------------------------------------
+; Historical defaults. data_adr and depa_adr both start at $2000.
+; This does not imply that overlapping input/output/stub is safe.
+
+default_file_location	equ	$2000
+default_depack_adr	equ	$2000
+default_init_vector	equ	$02e2
+			run	main
+			org	$0480
+
+; ----------------------------------------------------------------------------
+; DATA SEGMENT $0480-$06FB. Twelve blank-8-line commands, one ANTIC-2
+; LMS line and JVB. dlptr selects the offset prompt or progress line.
+; No private DLI/VBI handler is installed by this program.
+
+dlist			dta	$70,$70,$70,$70,$70,$70,$70,$70,$70,$70,$70,$70,$42
+dlptr			dta	a(line1),$41,a(dlist)
+
+; ----------------------------------------------------------------------------
+; Screen-code text. The field labelled source shows pack_limit_end-pack_src_ptr
+; (with the +256-byte padding included), NOT the actual source address.
+
+line0			dta	d'   source: $0000  length: $0000-00.'
+line1			dta	d'     Select offset: 1-6     ',$5f,d'           '
+dev_E			dta	c'E:',$9b
+dir_s			dta	c'Dx:*.*',$9b
+value			dta	a($0000)
+digit0			dta	$00
+digit1			dta	$00
+digit2			dta	$00
+prn_buff		dta	$00,$00,$00,$00,$00,$00
+
+; ----------------------------------------------------------------------------
+; XEX headers: FFFF, start, inclusive end. Followed by a second six-byte
+; record: vector start, vector end, depacker entry WORD. No second FFFF needed.
+
+file_header		dta	$ff,$ff
+file_seg_str		dta	a($0000)
+file_seg_end		dta	a($0000)
+init_seg_str		dta	a($0000)
+init_seg_end		dta	a($0000)
+depacker_entry_word	dta	a($0000)
+
+; ----------------------------------------------------------------------------
+; Message 0 is cmd_line. Most strings end in ATASCII EOL=$9B; questions
+; ending in zero must use msg_print_Z. Dates/credits below are literal binary
+; evidence, not independent proof of the historical release date.
+
+msg_addr		dta	a(cmd_line)
+			dta	a(msg01),a(msg02),a(msg03),a(msg04),a(msg05),a(msg06),a(msg07),a(msg08)
+			dta	a(msg09),a(msg0a),a(msg0b),a(msg0c),a(msg0d),a(msg0e),a(msg0f),a(msg10)
+			dta	a(msg11),a(msg12),a(msg13),a(msg14),a(msg15)
+msg01			dta	$9b
+msg02			dta	c' * ',c' Packer v2.2, (fast depacker) '*,c' *',$9b
+msg03			dta	c'    Writen by Soused Teat/Slight',$9b
+msg04			dta	$7f,c'   20 June 1994, Warsaw.',$9b
+msg05			dta	c'Input file (*-dir,#-DOS):',$9b
+msg06			dta	c'CIO Error #xxx',$9b
+msg07			dta	c' 00 files.',$9b
+msg08			dta	c'Press any key.',$9b
+msg09			dta	c'Output file (*-dir,#-DOS):',$9b
+msg0a			dta	c'Second pass. Wait.',$9b
+msg0b			dta	c'Save this as a file ?[Y/N] ',$00
+msg0c			dta	c'Actual adress is $xxxx-$yyyy.',$9b
+msg0d			dta	c'Please type a new adress : $',$00
+msg0e			dta	c'Adress of file location.',$9b
+msg0f			dta	c'Depack adress.',$9b
+msg10			dta	c'Before $xxxx, after $xxxx.',$9b
+msg11			dta	c'Include depacker ?[Y/N] ',$00
+msg12			dta	c'Adress to run.',$9b
+msg13			dta	c'First 6 bytes skiped.',$9b
+msg14			dta	c'Run after depack ?[Y/N] ',$00
+msg15			dta	c'Where to jump ?',$9b
+			org	$2000
+
+; ----------------------------------------------------------------------------
+; $2000: impose a fixed editor display list at $BC20 and fixed colors.
+; No old display list or colors were saved. Wait for RTCLOK low byte $14
+; to change; depends on the OS VBI. Original background is $06; historical
+; blk1.xsm/blk1.xex intentionally used $86 to identify Seban's RE build.
+
+restore_scr		lda	#$20			; restore the default DL at $BC20 (no saved display list)
+			sta	$0230
+			lda	#$BC
+			sta	$0231
+			lda	#$0C			; restore the default UI colors (not previously saved values)
+			sta	$02C5
+			lda	#$04
+			sta	$02C6
+			lda	#$06			; $2015: original color; Seban used $86 to distinguish his RE build.
+			sta	$02C8
+			lda	$14			; wait for the OS VBI tick in RTCLOK
+			cmp	$14
+			beq	*-2
+			rts
+
+; ----------------------------------------------------------------------------
+; $2020. IN A=message number. CIO #0 PUT RECORD (command 9).
+; Increments the previous high byte of requested length, rather than setting
+; a fixed length. Termination depends on $9B in the message.
+
+print_msg		asl	@			; message number is in A reg.; multiply by 2 to index the address table
+			ldx	#$00			; CIO channel #0
+			tay				; move message number multiplied *2 to Y reg.
+			lda	msg_addr+0,y		; load LO-byte of MSG addr from table
+			sta	$0344,x
+			lda	msg_addr+1,y		; load HI-byte of MSG addr from table
+			sta	$0345,x
+			lda	#$09			; CIO PUT RECORD command
+			sta	$0342,x			; store into CIO cmd register
+			inc	$0349,x			; incr. HI-byte of buffer length
+			jmp	$E456			; jump to OS CIO
+
+; ----------------------------------------------------------------------------
+; Close editor channel #0, or channel offset X (0,$10,$20...).
+; Status is returned by CIO in Y and condition flags; errors are not checked here.
+
+CIO_close0		ldx	#$00			; CIO channel #0 ('E:' editor)
+CIO_closeX		lda	#$0C			; CIO close command
+			sta	$0342,x			; store command
+			jmp	$E456			; jump to OS CIO
+
+; ----------------------------------------------------------------------------
+; Close #1 and #2. Only #1 carries file data in this supplied version.
+
+CIO_close_1_2		ldx	#$10			; select channel #1
+			jsr	CIO_closeX		; close channel
+			ldx	#$20			; select channel #2
+			bne	CIO_closeX		; close channel
+
+; ----------------------------------------------------------------------------
+; $204E. IN Y=low, X=high of unsigned 16-bit integer.
+; Decimal-mode doubling produces BCD; CLD before returning. OUT A/Y/X are
+; ATASCII units/tens/hundreds, not numeric digits and not restricted to 0..255.
+; prn_buff stores pairs in low-to-high order: 1234 -> "341200".
+
+bin2dec			sty	value+0			; store LO-byte value to conversion
+			stx	value+1			; store HI-byte value to conversion
+			lda	#$00			; clear the destination location
+			sta	digit0
+			sta	digit1
+			sta	digit2
+			ldx	#$10			; init X reg. (loop counter)
+			sed				; set the decimal mode flag
+bloop0			asl	value+0			; shift out the 16-bit binary value through carry
+			rol	value+1
+			lda	digit0			; add the carry to the digits (decimal mode is set)
+			adc	digit0
+			sta	digit0
+			lda	digit1			; next digits (carry/overflow from previous digits can occur)
+			adc	digit1
+			sta	digit1
+			rol	digit2			; shift carry into the highest decimal digit
+			dex				; decrement X reg. (loop counter)
+			bne	bloop0			; loop while X is not zero
+			cld				; clear decimal mode flag
+			jsr	set_prn_buf_adr		; set the print buffer address
+			lda	digit0
+			jsr	print_hex		; print 1st pair of digits
+			lda	digit1
+			jsr	print_hex		; print 2nd pair of digits
+			lda	digit2
+			jsr	print_hex		; print 3rd pair of digits
+			lda	prn_buff+1
+			ldy	prn_buff+0
+			ldx	prn_buff+3
+			rts
+
+; ----------------------------------------------------------------------------
+; text_ptr <- prn_buff; Y <- 0. Used for byte-pair formatting.
+
+set_prn_buf_adr		lda	<prn_buff
+			sta	text_ptr+0
+			lda	>prn_buff
+			sta	text_ptr+1
+			ldy	#$00
+			rts
+
+; ----------------------------------------------------------------------------
+; IN A=byte, text_ptr=buffer, Y=index. Write two uppercase hexadecimal
+; characters, advancing Y by two. Also formats each packed BCD byte.
+
+print_hex		pha				; save value on stack
+			lsr	@			; get the upper nibble!
+			lsr	@
+			lsr	@
+			lsr	@
+			jsr	print_digit		; print digit
+			pla				; restore value from stack
+
+; ----------------------------------------------------------------------------
+; Convert a nibble to ATASCII. CMP leaves C=1 for A..F; ADC #6
+; therefore adds seven. The implicit carry is intentional.
+
+print_digit		and	#$0F			; get the lower nibble
+			ora	#$30			; convert to ASCII
+			cmp	#$3A			; value > '9'
+			bcc	*+4			; no !
+			adc	#$06			; yes! add 6 + carry (7), to get ASCII 'A'..'F'
+			sta	(text_ptr),y		; store in memory location
+			iny				; next location
+			rts
+
+; ----------------------------------------------------------------------------
+; Call the internal XL ROM bell, then fall through to key prompt.
+
+any_key_bell		jsr	OS_GTIA_BELL		; do a direct OS-call to GTIA-bell procedure
+
+; ----------------------------------------------------------------------------
+; Print prompt and tail-call OS keyboard get. Unlike IGN entry, this
+; entry does not explicitly discard the already pending key.
+
+prs_any_key		jsr	print_EOL
+			lda	#$08			; message #8: "Press any key."
+			jsr	print_msg
+			jmp	OS_GET_KEY
+
+; ----------------------------------------------------------------------------
+; $20D0. IN Y=CIO error status (NOT A). X=0 selects 8-bit conversion.
+; Print decimal code, reset display, close files, bell/key, restart main.
+; Main resets S, discarding the old call stack.
+
+CIO_error		ldx	#$00			; convert the CIO error in Y to decimal; X=0 selects an 8-bit input
+			jsr	bin2dec
+			stx	msg06+11		; put the decimal digits into "CIO error" message body
+			sty	msg06+12
+			sta	msg06+13
+			lda	#$06			; message #6: "CIO Error #___"
+			jsr	print_msg		; print message
+			jsr	restore_scr		; restore the default OS display list and UI colors
+			jsr	CIO_close_1_2		; close CIO channels #1 & #2
+			jsr	any_key_bell		; do system error beep, write message, and wait for any key!
+			jmp	main			; restart the program!
+
+; ----------------------------------------------------------------------------
+; OPEN #0,12,...,"E:" (read AND write); AUX2 is left unchanged.
+; The old comment said mode 4, but the actual ICAX1 value is $0C.
+
+open_E			ldx	#$00			; channel #0
+			lda	#$03			; CIO OPEN command
+			sta	$0342,x			; store in CIO cmd reg.
+			lda	#$0C			; Read/Write flag
+			sta	$034A,x			; store in CIO AUX reg.
+			lda	<dev_E			; load LO-byte of device name string
+			sta	$0344,x
+			lda	>dev_E
+			sta	$0345,x			; store HI-byte of device name string address
+			jsr	$E456			; call OS CIO
+			bmi	*+3			; any error detected?
+			rts				; no! return to caller.
+			jmp	CIO_error		; if CIO error is present jump to CIO error procedure!
+
+; ----------------------------------------------------------------------------
+; IN A=OPEN mode: 4 read, 8 write, 6 directory. X becomes $10.
+; Filename from cmd_line except mode 6, which uses dir_s. C: receives AUX2=$80
+; (short inter-record gaps); this is device setup, not proof that a multi-pass
+; tape workflow is practical. Return CIO Y/status flags.
+
+CIO_open_ch1		ldx	#$10			; channel #1
+			sta	$034A,x			; store into the ICAX1
+			cmp	#$06			; "directory open"?
+			beq	dir_open		; yes!
+			lda	<cmd_line		; LO-byte of command-line buffer
+			ldy	>cmd_line		; HI-byte of command-line buffer
+			bne	def_open
+dir_open		lda	<dir_S			; LO-byte of DIR string
+			ldy	>dir_S			; HI-byte of DIR string
+def_open		sta	$0344,x			; < buffer address for CIO
+			sta	file_name_ptr+0
+			tya
+			sta	$0345,x			; > buffer address for CIO
+			sta	file_name_ptr+1
+			lda	#$03			; open command
+			sta	$0342,x			; store into ICCOM
+			ldy	#$00			; get the device name from command line
+			lda	(file_name_ptr),y
+			cmp	#'C'			; is that a tape recorder?
+			bne	*+4			; no...
+			ldy	#$80			; yes! tape recorder, set the "short" pauses between records
+			tya
+			sta	$034B,x			; store into ICAX2
+			jmp	$E456
+
+; ----------------------------------------------------------------------------
+; Tail-call single-byte console output with ATASCII EOL.
+
+print_EOL		ldy	#$9B
+			jmp	CIO_putchar_E
+
+; ----------------------------------------------------------------------------
+; Read command line. Empty line restarts main; *<unit> lists directory;
+; # jumps through DOSVEC ($000A). C=1 after a directory listing, C=0 for a name.
+
+get_cmd_line		ldx	#$00			; select channel #0 (editor)
+			jsr	CIO_inputX		; call CIO input command at channel number passed in X reg.
+			lda	cmd_line		; get 1st char from user input
+			cmp	#$9B			; EoL char in command line? (empty command line)
+			bne	check_next		; check for other cases...
+			jmp	main			; restart program
+check_next		cmp	#'*'			; check if the user wants to display a disk directory ("*" symbol entered)
+			beq	print_dir		; jump to directory display procedure
+			cmp	#'#'			; check if the user wants to exit the program ("#" symbol entered)
+			bne	other_cmd		; handle another string or command
+			jmp	($000A)			; exit to DOS!
+other_cmd		clc
+			rts
+
+; ----------------------------------------------------------------------------
+; Replace x in Dx:*.* with input character 1. Count records, then subtract
+; one for the final free-sector line. Assumes that directory convention;
+; counter wraps at 256 and only the last two decimal digits are printed.
+
+print_dir		lda	cmd_line+1		; get drive number
+			sta	dir_S+1			; store in the DIR open string
+			lda	#$06			; directory OPEN flag!
+			jsr	CIO_open_ch1
+			bpl	*+5
+			jmp	CIO_error
+			lda	#$00			; clear the variable, that will be used for counting number of files in directory
+			sta	value
+dir_loop		jsr	CIO_input1		; read "dir entry" record from CIO channel #1
+			cpy	#$88			; check for EoF...
+			beq	end_of_dir		; yes! end of dir entries reached...
+			inc	value			; increment variable counting number of files on disk
+			lda	#$00			; print out the input buffer
+			jsr	print_msg
+			jmp	dir_loop
+end_of_dir		dec	value			; subtract one: assumes the last record is "xxx free sectors"
+			ldy	value			; load # of dir entries into Y reg.
+			ldx	#$00
+			jsr	bin2dec			; convert to decimal
+			sty	msg07+1			; store the result in the 7th msg. body
+			sta	msg07+2
+			lda	#$07			; print the message " __ files."
+			jsr	print_msg
+			jsr	CIO_close_1_2		; close CIO channels
+			jsr	print_EOL
+			sec
+			rts
+
+; ----------------------------------------------------------------------------
+; Unreferenced entry in this binary. Command 7 with the generic buffer.
+
+CIO_get1		ldx	#$10			; CIO channel #1
+			lda	#$07			; CIO "GET BYTES" command
+			bne	CIO_getX
+
+; ----------------------------------------------------------------------------
+; CIO GET RECORD entry for channel #1 or the channel offset in X.
+
+CIO_input1		ldx	#$10			; CIO channel #1
+CIO_inputX		lda	#$05			; CIO INPUT command
+
+; ----------------------------------------------------------------------------
+; Read into $0400. Requested low length=$28; high length is TXA.
+; Thus #0 requests 40, #1 requests $1028, despite the small command buffer.
+; EOF=$88 and truncated-record=$89 are accepted. Handler semantics matter.
+
+CIO_getX		sta	$0342,x			; store in CIO-CMD
+			lda	<cmd_line		; LO-byte of command line buffer
+			sta	$0344,x
+			lda	>cmd_line		; HI-byte of command line buffer
+			sta	$0345,x
+			lda	#$28			; set LO-byte of buffer length to $28 (40)
+			sta	$0348,x
+			txa				; channel #0: length=$0028; channel #1: length=$1028
+			sta	$0349,x
+			jsr	$E456			; call the main CIO routine
+			bpl	CIO_OK			; jump when no error!
+			cpy	#$88			; EOF is also accepted
+			beq	CIO_OK
+			cpy	#$89			; truncated record is also accepted
+			beq	CIO_OK
+			jmp	CIO_error
+CIO_OK			rts
+
+; ----------------------------------------------------------------------------
+; Unreferenced GET BYTE entry; shared body is used for output.
+
+CIO_get_byte1		ldx	#$10			; CIO channel #1
+			lda	#$07			; CIO "GET BYTES" command
+
+; ----------------------------------------------------------------------------
+; IN A=command, X=channel offset, Y=byte for output. Zero buffer length
+; selects one-byte CIO in A. CIO status is in Y on return; errors restart main.
+
+CIO_byteX		sta	$0342,x			; store into ICCOM
+			lda	#$00			; set the length at zero, that means that we will only send/receive one byte
+			sta	$0348,x
+			sta	$0349,x
+			tya				; for PUT BYTE, the byte to write is in Y reg.
+			jsr	$E456			; call system CIO routine
+			bmi	*+3			; error occurred?
+			rts				; all OK, return
+			jmp	CIO_error
+
+; ----------------------------------------------------------------------------
+; Write Y to the editor via CIO command 11.
+
+CIO_putchar_E		ldx	#$00			; CIO channel #0
+			lda	#$0B			; CIO "PUT BYTES" command
+			bne	CIO_byteX
+
+; ----------------------------------------------------------------------------
+; Write Y to output file via CIO command 11.
+
+CIO_putchar_1		ldx	#$10			; CIO channel #1
+			lda	#$0B			; CIO "PUT BYTES" command
+			bne	CIO_byteX
+
+; ----------------------------------------------------------------------------
+; $21FE / $2202. IN Y=descriptor index (not byte offset).
+; 0=input buffer/$9000; 1=output buffer/dynamic count; 2=XEX header/6;
+; 3=discard first input bytes/6; 4=vector segment/6. Returns raw CIO status.
+
+block_write		lda	#$0B			; CIO "PUT BYTES" CIO command
+			bne	CIO_rw
+block_read		lda	#$07			; CIO "GET BYTES" CIO command
+CIO_rw			ldx	#$10			; CIO channel #1
+			sta	$0342,x			; ... store into ICCOM
+			tya				; calculate index
+			asl	@			; *2
+			asl	@			; *4
+			tay				; send to the Y reg. (used as index register)
+			lda	blk_adr_tab+0,y		; get LO-byte of buffer address
+			sta	$0344,x			; store into LO-byte of ICBUFA
+			lda	blk_adr_tab+1,y		; get HI-byte of buffer address
+			sta	$0345,x			; store into HI-byte of ICBUFA
+			lda	blk_adr_tab+2,y		; get LO-byte of buffer length
+			sta	$0348,x			; store into LO-byte of ICBUFL
+			lda	blk_adr_tab+3,y		; get HI-byte of buffer length
+			sta	$0349,x			; store into HI-byte of ICBUFL
+			jmp	$E456			; call main CIO routine
+
+; ----------------------------------------------------------------------------
+; Four-byte descriptors: buffer word, count word. Descriptor 1 count
+; is self-modified after pass 1 and after appending the relocated depacker.
+; config for read block (buffer address, buffer length)
+
+blk_adr_tab		dta	a(data_buffer),a(data_buffer_len)
+			dta	a(data_buffer),a($0000)	; config for write block (buffer address, block length calculated in code)
+			dta	a(file_header),a($0006)	; config for writing the file header
+			dta	a(data_buffer),a($0006)	; config for skipping first six bytes of an input file
+; config for writing the init/run segment
+
+			dta	a(init_seg_str),a($0006)
+
+; ----------------------------------------------------------------------------
+; $223C ENTRY. Reset stack, close/reopen channels, impose screen defaults.
+; Does NOT initialize cfg_flags, disable BASIC, reserve memory, or validate
+; the ROM entry points. File-address defaults reset on every return here.
+
+main			ldx	#$ff			; set stack pointer
+			txs
+			jsr	CIO_close0		; close CIO channel #0 (system editor)
+			jsr	CIO_close_1_2		; close CIO channels #1 & #2
+			jsr	open_E			; open system editor
+			jsr	restore_scr		; restore the default DL and "user interface" colours
+			lda	#$10			; set the keyboard delay rate
+			sta	$02D9
+			lda	#$03			; set the auto-repeat speed
+			sta	$02DA
+			lda	<default_file_location	; set the defaults for LO-bytes of...
+			sta	data_adr+0		; load address
+			sta	depa_adr+0		; depack address
+			lda	>default_file_location	; set the defaults for HI-bytes of...
+			sta	data_adr+1		; load address
+			sta	depa_adr+1		; depack address
+			lda	<default_init_vector	; set defaults for INIT/RUN vector
+			sta	init_seg_addr+0		; update LO-byte
+			lda	>default_init_vector
+			sta	init_seg_addr+1		; update HI-byte
+			lda	#$02			; print 2nd message: "Packer v2.2, (fast depacker)"
+			jsr	print_msg
+			lda	#$03			; print 3rd message: "Writen by Soused Teat/Slight"
+			jsr	print_msg
+			lda	#$04			; print 4th message: "20 June 1994, Warsaw."
+			jsr	print_msg
+			jsr	print_EOL
+inpf_loop		lda	#$05			; print 5th message "Input file (*-dir,#-DOS):"
+			jsr	print_msg
+			jsr	get_cmd_line		; get input from system console/command line
+			bcs	inpf_loop		; directory displayed; ask for an input filename again
+			lda	#$04			; try to open CIO channel #1 for file read
+			jsr	CIO_open_ch1		; call internal CIO open subroutine
+			bpl	input_open_ok		; all OK!
+			jmp	CIO_error		; when error jump to error handler
+
+; ----------------------------------------------------------------------------
+; SKSTAT read bit3 is active-low SHIFT. If held now, blindly read/discard
+; six bytes. No FFFF check, no segment parsing, no address import from XEX.
+
+input_open_ok		lda	$D20F			; check SHIFT key (when pressed, skip the first 6 bytes of the input file)
+			and	#$08
+			bne	no_header_skip		; no SHIFT key pressed, omit the six-byte skip
+			ldy	#$03			; read/discard the first 6 bytes; no DOS/XEX header validation
+			jsr	block_read
+			bpl	*+5			; all OK! skip call to error handler!
+			jmp	CIO_error		; jump to error handler
+			lda	#$13			; print 19th message: "First 6 bytes skiped."
+			jsr	print_msg
+
+; ----------------------------------------------------------------------------
+; Request $9000 bytes but accept ONLY EOF status $88. Actual count from
+; IOCB #1 becomes true_input_length. Exact-limit behavior depends on the handler.
+; Then clear 512 bytes after input WITHOUT checking RAM/screen boundaries.
+
+no_header_skip		ldy	#$00			; set config for file reading...
+			jsr	block_read		; ... and try to read the whole input file into data buffer
+			cpy	#$88			; check for EoF
+			beq	*+5			; only EOF is accepted here; a full read without EOF goes to error
+			jmp	CIO_error		; call error handler
+			clc
+			lda	$0358			; get the LO-byte of the file length (ICBUFL) from CIO channel #1
+			sta	true_input_length+0
+			adc	<data_buffer
+			sta	input_end_ptr+0
+			lda	$0359			; get the HI-byte of the file length (ICBUFL) from CIO channel #1
+			sta	true_input_length+1
+			adc	>data_buffer
+			sta	input_end_ptr+1
+			ldy	#$00
+			tya
+clr_loop1		sta	(padding_ptr),y		; clear first 256 bytes after loaded data (not necessarily page-aligned)
+			iny
+			bne	clr_loop1
+			inc	padding_ptr+1		; next page
+clr_loop2		sta	(padding_ptr),y		; clear the following 256 bytes
+			iny
+			bne	clr_loop2
+			dec	padding_ptr+1		; restore HI-byte of padding_ptr to the true input end
+			jsr	CIO_close_1_2		; close CIO channels #1 & #2
+outf_loop		lda	#$09			; print 9th message "Output file (*-dir,#-DOS):"
+			jsr	print_msg
+			jsr	get_cmd_line		; get input from system console/command line input
+			bcs	outf_loop		; directory displayed; ask for an output filename again
+			lda	#$08			; open CIO channel #1 for write
+			jsr	CIO_open_ch1		; use the CIO channel #1 for writing
+			bpl	output_open_ok		; check for errors
+			jmp	CIO_error		; when something is wrong call the error handler
+
+; ----------------------------------------------------------------------------
+; Open output before compression. The name denotes both the intermediate
+; file and final file; pass 2 later reopens this same name for read and write.
+; Switch to the one-line display and initialize source at $2B00.
+
+output_open_ok		lda	<dlist			; set the new DL (info screen during compression)
+			sta	$0230
+			lda	>dlist
+			sta	$0231
+			lda	#$00			; set the BLACK border color
+			sta	$02C8
+			ldy	<line1			; set the display list text address for info line #1
+			ldx	>line1
+			sty	dlptr+0
+			stx	dlptr+1
+			lda	<data_buffer		; load the LO-byte of data buffer address...
+			sta	pack_src_ptr+0		; ... store it in source data pointer
+			sta	pack_src_saved_unused+0	; ... and mirror of source data pointer (never read afterward)
+			lda	>data_buffer		; load the HI-byte of data buffer address...
+			sta	pack_src_ptr+1		; ... store it in source data pointer
+			sta	pack_src_saved_unused+1	; ... and mirror of source data pointer (never read afterward)
+			sec				; let's calculate raw file len (used for calculation of compression ratio)
+			lda	input_end_ptr+0		; load LO-byte of data_end pointer
+			sbc	<data_buffer		; subtract LO-byte of data buffer address
+			sta	pack_input_length+0	; store LO-byte of result
+			lda	input_end_ptr+1		; load HI-byte of input end pointer
+			sbc	>data_buffer		; subtract HI-byte of data buffer address
+			sta	pack_input_length+1	; store HI-byte of result
+			ldx	#$41			; set X position for printing file length, during the question about offset.
+			jsr	put_hex_I		; print HI-byte of file length (HI-byte of raw_file_len is already in A reg.)
+			lda	pack_input_length+0
+			jsr	put_hex_I		; print LO-byte of file length
+
+; ----------------------------------------------------------------------------
+; Accept UI 1..6; store k=answer-1. Search distance max=(256<<k)-1.
+; The extra table entries for k=6,7 are unreachable through this UI.
+
+ask_offset		jsr	OS_GET_KEY_IGN		; jump to GET_KEY procedure (directly from OS-ROM)
+			cmp	#'1'			; check if the key value is below '1'
+			bcc	ask_offset		; yes! so repeat the key loop!
+			cmp	#'7'			; check if the key value is greater than or equal to '7'
+			bcs	ask_offset		; yes! so repeat the key loop!
+			sec				; set the carry
+			sbc	#'1'			; subtract ASCII value of '1'
+			sta	pack_offset_bits	; store k=0..5: number of additional distance bits
+			ldy	<line0			; load the LO-byte of message
+			ldx	>line0			; load the HI-byte of message
+			sty	dlptr+0			; store LO in display list
+			stx	dlptr+1			; store HI in display list
+			lda	#$08			; load default value for bit-counter
+			sta	pack_free_bits		; move value to the bit-counter
+			ldy	#$00			; clear the Y reg.
+			sty	pack_unused_init	; clear pack_unused_init (never read in this binary)
+			sty	pack_written_bytes+0	; clear LO-byte of output data length
+			sty	pack_written_bytes+1	; clear HI-byte of output data length
+			jsr	upd_out_length		; update the output length info on screen
+			lda	pack_offset_bits	; get k, the additional distance-bit count...
+			jsr	put_8bit		; ... and put k as the first byte of the output stream
+			ldy	#$00			; clear Y reg.
+			lda	(pack_src_ptr),y	; load 1st byte of input data buffer
+			jsr	put_8bit		; and put it directly to output stream
+			inc	pack_src_ptr+0		; increment pack_src_ptr
+			bne	*+4
+			inc	pack_src_ptr+1
+			lda	#$00			; load 0 into A reg.
+			sta	pack_progress_work+0	; clear LO-byte
+			sta	pack_progress_work+1	; clear HI-byte
+			inc	pack_limit_end+1	; increment HI-byte: input end becomes pack limit (+256)
+			ldx	pack_offset_bits	; load offset byte to X reg.
+			lda	offset_table,x		; get the window size in pages (1 << k)
+			sta	offset_HI_byte+1	; patch the immediate window-size operand of SBC below
+
+; ----------------------------------------------------------------------------
+; $2373 PASS 1. Search begins max($2B00, src-(256<<k)+1).
+; The search window excludes the current byte; that byte acts as a natural
+; sentinel for the first-byte scan. No hash table or search tree here;
+; the length-code decision tree is a separate part of token encoding.
+
+pack_loop		sec
+			lda	pack_src_ptr+1		; load HI-byte of source data pointer
+offset_HI_byte		sbc	#$00			; subtract the window size in pages
+			bcc	offset_overflow		; carry cleared? subtraction underflow; clamp to data buffer
+			cmp	>data_buffer		; compare the result with HI-byte of data buffer
+			bcc	offset_overflow		; if window start is below the data buffer, clamp it
+			sta	pack_candidate_ptr+1	; store HI-byte of result into HI-byte of sequence search address pointer
+			ldx	pack_src_ptr+0		; take the LO-byte of source data pointer into X reg.
+			inx				; increment X reg.
+			stx	pack_candidate_ptr+0	; store the incremented value (+1) into LO-byte of seq. pointer
+			bne	*+4			; no low-byte wrap? skip the high-byte increment
+			inc	pack_candidate_ptr+1	; if overflow, adjust HI-byte of seq. pointer
+			jmp	off_calc_done		; seq. addr. calculation done
+offset_overflow		lda	<data_buffer		; load LO-byte of data buffer
+			sta	pack_candidate_ptr+0	; move to LO-byte of seq. ptr
+			lda	>data_buffer		; load HI-byte of data buffer
+			sta	pack_candidate_ptr+1	; move to HI-byte of seq. ptr
+
+; ----------------------------------------------------------------------------
+; Display remaining padded input, clear best length, and patch current
+; byte/address into the search instructions. These operands must be writable.
+
+off_calc_done		sec
+			lda	pack_limit_end+0	; load LO-byte of padded input limit
+			sbc	pack_src_ptr+0		; subtract LO-byte of source data pointer
+			pha				; store result
+			lda	pack_limit_end+1	; load HI-byte of padded input limit
+			sbc	pack_src_ptr+1		; subtract HI-byte of source data pointer
+			ldx	#$0C			; set X position for printing hex value in 'source $____' location
+			jsr	put_hex_I		; print HI-byte of remaining padded input (limit - source)
+			pla				; get the LO-byte of the subtraction result from the stack
+			jsr	put_hex_I		; print LO-byte of remaining padded input (limit - source)
+			ldy	#$00			; clear the Y reg.
+			sty	pack_match_length	; zero the best sequence length
+			lda	(pack_src_ptr),y	; load actual byte from source data pointer
+			sta	search_for+1		; patch the searched byte into the immediate LDA below
+			lda	pack_src_ptr+0		; load LO-byte of source data pointer
+			sta	src0_LO+1		; store in byte search loop
+			sta	src1_LO+1		; store in seq. search loop
+			lda	pack_src_ptr+1		; load HI-byte of source data pointer
+			sta	src1_HI+1		; store in seq. search loop
+
+; ----------------------------------------------------------------------------
+; Scan for the next equal first byte with CMP abs,Y. X tracks the high
+; page while Y tracks its low byte. Finding src itself terminates the scan.
+
+search_for		lda	#$00			; we will be searching for this byte
+			ldy	pack_candidate_ptr+0	; load LO-byte of SEQ ptr into Y reg.
+			ldx	pack_candidate_ptr+1	; load HI-byte of SEQ ptr into X reg.
+			stx	seq0_HI+2		; store HI-byte of ptr directly into code (self-modif. code hack)
+seq0_HI			cmp	$FF00,y			; compare searched byte with current value @ seq. pointer location
+			beq	src0_LO			; source byte and seq. byte are equal, go and check details
+			iny				; increment Y reg. (LO-byte of candidate pointer)
+			bne	seq0_HI			; if no overflow occurred, then jump and compare next byte
+			inc	seq0_HI+2		; increment HI-byte of candidate pointer in the CMP operand
+			inx				; ... and increment also X reg.
+			jmp	seq0_HI			; repeat search loop
+src0_LO			cpy	#$00			; compare Y reg. with LO-byte of src_ptr (self mod. code)
+			bne	byte_found		; if not equal (not end of search window) jump to next phase of searching
+			cpx	pack_src_ptr+1		; compare with HI-byte of end of search window
+			bne	byte_found		; if not at the source position, check this candidate
+			jmp	off_loop_done		; byte search in offset boundaries is done! jump out of the loop.
+
+; ----------------------------------------------------------------------------
+; Compare second byte, then offsets 2..255. If all 256 bytes compare
+; equal, Y wraps and DEY yields 255: the encoder never emits length 256.
+
+byte_found		sty	pack_candidate_ptr+0	; store LO-byte of seq. pointer
+			stx	pack_candidate_ptr+1	; store HI-byte of seq. pointer
+			ldy	#$01			; move to 2nd byte
+			lda	(pack_src_ptr),y	; get 2nd byte from source
+			cmp	(pack_candidate_ptr),y	; compare with 2nd byte from seq. ptr.
+			bne	seq_mismatch		; 2nd bytes of src. and seq. are not equal
+			iny				; incr. index (for comparing next byte)
+seq_loop		lda	(pack_src_ptr),y	; load next byte from source buffer
+			cmp	(pack_candidate_ptr),y	; compare with earlier data
+			bne	seq_end
+			iny
+			bne	seq_loop
+			dey
+
+; ----------------------------------------------------------------------------
+; Accept equal-length ties too, replacing the previous candidate.
+; Only VISITED candidates participate: this is not exhaustive longest-match
+; search. A later visited equal match has a smaller distance.
+
+seq_end			cpy	pack_match_length
+			bcc	seq_shorter
+			sty	pack_match_length
+			lda	pack_candidate_ptr+0
+			sta	pack_match_address+0
+			stx	pack_match_address+1	; X still holds the high byte of the candidate address.
+			dey
+
+; ----------------------------------------------------------------------------
+; Candidate skip: rejected second byte advances by 2; a shorter match
+; advances by length+1; an accepted match (DEY above) advances by length.
+; This can skip a better overlapping candidate. Preserve for binary parity.
+
+seq_shorter
+seq_mismatch		tya
+			sec
+			adc	pack_candidate_ptr+0
+			sta	pack_candidate_ptr+0
+			bcc	src1_LO
+			inc	pack_candidate_ptr+1
+			inx
+src1_LO			cmp	#$00			; compare LO-byte (self mod. code)
+			txa
+src1_HI			sbc	#$00			; compare HI-byte (self mod. code)
+			bcc	search_for
+
+; ----------------------------------------------------------------------------
+; best_len=0 -> emit literal flag 0 and its eight bits. Otherwise emit
+; a match. The first input byte was already emitted without a flag.
+
+off_loop_done		ldy	#$00			; clear Y reg.
+			lda	pack_match_length	; check sequence length
+			bne	emit_match		; seq. len >0 then jump to "encode packed sequence"
+			jsr	put_1bit		; put literal flag 0 into output stream
+			lda	(pack_src_ptr),y	; load the non-packed byte into A reg.
+			jsr	put_8bit		; push non-packed byte onto output stream
+			inc	pack_src_ptr+0		; increment LO-byte
+			bne	*+4			; overflow? (no, then skip next incrementing HI-byte)
+			inc	pack_src_ptr+1		; increment HI-byte
+			jmp	check_end_adr
+
+; ----------------------------------------------------------------------------
+; Emit match flag 1, then length code. Lengths 2..11 use tables; >=12
+; uses seven 1 bits plus a full length byte. All fields are bit-packed here.
+
+emit_match		lda	pack_match_length
+			ldx	#$20			; set X position for printing hex value of "match length" in 'length: $0000-__.' location
+			jsr	put_hex_I		; update sequence length on the screen
+			lda	#$01			; put "1" bit into output stream (that means packed sequence)
+			jsr	put_1bit
+			ldy	pack_match_length
+			cpy	#$0C			; check seq len.
+			bcs	encode_as_is
+			ldx	sbit_lens-2,y
+			lda	sbit_vals-2,y
+			jsr	put_xbits
+			jmp	send_offset
+
+; ----------------------------------------------------------------------------
+; Length-code lengths/values for lengths 2..11. These exclude token flag.
+; 2:0; 3..5:100/101/110; 6..8:11100/11101/11110;
+; 9..11:1111100/1111101/1111110; >=12:1111111 + byte.
+; sequence bit lengths
+
+sbit_lens		dta	$01,$03,$03,$03,$05,$05,$05,$07,$07,$07
+; sequence bit values
+
+sbit_vals		dta	$00,$04,$05,$06,$1C,$1D,$1E,$7C,$7D,$7E
+; window size in pages; UI selects only the first six entries
+
+offset_table		dta	$01,$02,$04,$08,$10,$20,$40,$80
+encode_as_is		ldx	#$07			; load #7 into X reg (bit-loop counter)
+			lda	#$FE			; send the top seven bits: %1111111
+			jsr	put_bloop
+			lda	pack_match_length	; send sequence length byte to output
+			jsr	put_8bit
+
+; ----------------------------------------------------------------------------
+; Convert chosen candidate address to distance=src-candidate. Emit low
+; eight bits first, then k high bits; all are MSB-first within each field.
+
+send_offset		sec
+			lda	pack_src_ptr+0
+			sbc	pack_match_address+0
+			sta	pack_match_distance+0	; Same byte: address low becomes distance low.
+			lda	pack_src_ptr+1
+			sbc	pack_match_address+1
+			sta	pack_match_distance+1	; After high subtraction, the word holds the distance.
+			lda	pack_match_distance+0	; put LO-byte of offset @ output stream
+			jsr	put_8bit
+			ldx	pack_offset_bits	; X=k: are any bits above the low eight needed?
+			beq	off_skip_hi		; k=0: skip the high distance bits
+			lda	pack_match_distance+1	; load HI-byte of match distance into A reg.
+			jsr	put_xbits		; put X high distance bits into output stream
+off_skip_hi		clc				; add the found sequence length to the src address pointer
+			lda	pack_match_length	; load seq. len into A reg.
+			adc	pack_src_ptr+0		; add LO-byte
+			sta	pack_src_ptr+0		; store
+			bcc	*+4			; check for carry (overflow)
+			inc	pack_src_ptr+1		; adjust HI-byte if carry was set
+
+; ----------------------------------------------------------------------------
+; Toggle background and compare src >= padded end. Last match may
+; advance beyond it: no clipping to original length or padded end here.
+
+check_end_adr		lda	#$00			; at each loop pass make some colback changes
+			eor	#$04
+			sta	check_end_adr+1		; put directly into upper LDA value (self mod. code)
+			sta	$D01A			; write color value into COLBACK register
+			lda	pack_src_ptr+0		; check LO-byte
+			cmp	pack_limit_end+0
+			lda	pack_src_ptr+1		; check HI-byte
+			sbc	pack_limit_end+1
+			bcs	pack_loop_done		; jump if no more data to process
+			jmp	pack_loop
+
+; ----------------------------------------------------------------------------
+; If partial byte remains, pushing eight zero bits flushes that byte;
+; remaining zero bits are not written. Save PASS1 byte count + FOUR header
+; bytes, close file, move to output choices. No end-marker token is emitted.
+
+pack_loop_done		lda	pack_free_bits		; free bit positions; 8 means no partial byte to flush
+			cmp	#$08
+			beq	bit_buff_empty
+			lda	#$00			; flush the partial byte with zero bits; no dedicated EOF marker
+			jsr	put_8bit		; feed eight zero bits to emit the pending partial byte
+bit_buff_empty		clc				; include destination and true-length words in final block size (+4)
+			lda	pack_written_bytes+0
+			adc	#$04
+			sta	packed_block_size+0
+			sta	blk_adr_tab+6
+			lda	pack_written_bytes+1
+			adc	#$00
+			sta	packed_block_size+1
+			sta	blk_adr_tab+7
+			jsr	CIO_close_1_2		; close CIO channels
+			jmp	finish_1st_pass
+
+; ----------------------------------------------------------------------------
+; Bit emitter: emit low bit of A. put_2bit is unreferenced in pass 1.
+; put_8bit emits MSB-first; put_xbits aligns the low X bits before emitting.
+; The rotations and carry states are part of the format contract.
+
+put_1bit		lsr	@
+			ldx	#$01
+			bne	put_bits
+put_2bit		lsr	@
+			ror	@
+			ldx	#$02
+			bne	put_bits
+put_8bit		ldx	#$08
+			bne	put_bloop
+put_xbits		stx	pack_field_bits
+			inx
+put_xloop		ror	@
+			dex
+			bne	put_xloop
+			ldx	pack_field_bits
+put_bloop		asl	@
+put_bits		rol	pack_bit_buffer
+			dec	pack_free_bits
+			beq	put_byte
+put_cntloop		dex				; all bits pushed?
+			bne	put_bloop
+			rts
+
+; ----------------------------------------------------------------------------
+; Write completed pack_bit_buffer to CIO #1, preserving local A/X/Y.
+; Update count on every byte; refresh progress only at 256-byte boundaries.
+
+put_byte		stx	pack_io_saved_x
+			sty	pack_io_saved_y
+			sta	pack_io_saved_a
+			ldy	pack_bit_buffer		; get value from bit_buffer
+			jsr	CIO_putchar_1		; write to output file
+			inc	pack_written_bytes+0	; increment LO-byte of output file length
+			bne	put_skip_upd		; if not overflowed skip incrementing HI-byte, and skip stats update
+			inc	pack_written_bytes+1	; increment HI-byte of output file length
+			jsr	upd_out_length		; update displayed size estimate
+put_skip_upd		lda	#$08
+			sta	pack_free_bits
+			lda	pack_io_saved_a
+			ldy	pack_io_saved_y
+			ldx	pack_io_saved_x
+			jmp	put_cntloop
+
+; ----------------------------------------------------------------------------
+; Write hexadecimal SCREEN codes at line0+X (not ATASCII/CIO).
+
+put_hex_I		pha				; store the value
+			lsr	@			; get upper nibble
+			lsr	@
+			lsr	@
+			lsr	@
+			jsr	put_digit_I
+			pla				; restore the value
+			and	#$0F			; get lower nibble
+put_digit_I		ora	#$10			; add '0' in internal ANTIC codes
+			cmp	#$1A			; check if > '9'
+			bcc	*+4
+			adc	#$06			; add 6 + carry (7), to get 'A'..'F' in ANTIC screen codes
+			sta	line0,x			; store at info line, when alternative screen layout is present during compression
+			inx
+			rts
+
+; ----------------------------------------------------------------------------
+; UI estimate = input_length - (src-$2B00) + emitted_pass1_bytes.
+; pack_progress_work is intermediate scratch: final high byte stays in A.
+; Called at emitted-byte page boundaries, so omitted count low byte is zero.
+; This is remaining raw bytes plus emitted bytes, not final size or a ratio.
+
+upd_out_length		clc
+			lda	>data_buffer
+			adc	pack_written_bytes+1
+			sta	pack_progress_work+1
+			sec
+			lda	pack_src_ptr+0
+			sbc	#$00			; $00 is <data_buffer; subtract the low byte of the buffer base
+			sta	pack_progress_work+0
+			lda	pack_src_ptr+1
+			sbc	pack_progress_work+1
+			sta	pack_progress_work+1
+			sec
+			lda	pack_input_length+0
+			sbc	pack_progress_work+0
+			sta	pack_progress_work+0
+			lda	pack_input_length+1
+			sbc	pack_progress_work+1
+			ldx	#$1B			; set screen position for the estimated size in 'length: $____-00.'
+			jsr	put_hex_I		; print HI-byte of estimated size: input - consumed + written
+			lda	pack_progress_work+0	; load LO-byte
+			jmp	put_hex_I		; print LO-byte of the same estimate
+
+; ----------------------------------------------------------------------------
+; $2559. Print before=true input length and after=pass1_bytes+4.
+; Ask about XEX wrapping. N still produces a file: the RAW fast stream.
+; BUG: first ROR leaves previous bit7 in bit6 when N skips the second ROR.
+
+finish_1st_pass		jsr	print_EOL
+			lda	<msg10			; LO-byte of msg10 address
+			sta	text_ptr+0
+			lda	>msg10			; HI-byte of msg10 address
+			sta	text_ptr+1
+			ldy	#$08			; set the X position of printed hex numbers
+			lda	true_input_length+1
+			jsr	print_hex
+			lda	true_input_length+0
+			jsr	print_hex
+			ldy	#$15			; set the X position of printed hex numbers
+			lda	packed_block_size+1
+			jsr	print_hex
+			lda	packed_block_size+0
+			jsr	print_hex
+			lda	#$10			; print the 16th message: "Before $____, after $____."
+			jsr	print_msg
+			jsr	print_EOL
+			jsr	restore_scr
+			lda	#$0B			; select 11th message: "Save this as a file ?[Y/N] ",
+			jsr	yes_or_no		; ... and ask user for decision.
+			ror	cfg_flags
+			bmi	save_as_file
+			jmp	second_pass
+
+; ----------------------------------------------------------------------------
+; Choose depack destination and packed-stream runtime load address.
+; Ranges displayed are informational; no overlap/wrap/ROM collision check.
+; Second answer shifts first Y into bit6 and depacker choice into bit7.
+
+save_as_file		jsr	print_EOL
+			lda	#$0F			; print out the 15th message: "Depack adress."
+			ldx	#depa_adr
+			ldy	#true_input_length
+			jsr	input_address
+			jsr	print_EOL
+			lda	#$0E			; print out the 14th message "Adress of file location."
+			ldx	#data_adr
+			ldy	#packed_block_size
+			jsr	input_address
+			jsr	print_EOL
+			lda	data_adr+0
+			sta	file_seg_str+0
+			lda	data_adr+1
+			sta	file_seg_str+1
+			lda	ui_result_end+0
+			sta	file_seg_end+0
+			lda	ui_result_end+1
+			sta	file_seg_end+1
+			lda	#$11			; select 17th message: "Include depacker ?[Y/N] "
+			jsr	yes_or_no		; ... and ask user for decision.
+			ror	cfg_flags
+			bpl	second_pass		; no depacker selected, so go directly to 2nd pass.
+			lda	#$02			; set default "init segment size" (2 bytes)
+			sta	init_seg_size+0
+			lda	#$00
+			sta	init_seg_size+1
+			ldx	#$03			; clear post-depack jump address and its displayed range length
+
+; ----------------------------------------------------------------------------
+; Prepare a two-byte vector destination and one-byte displayed jump target
+; range. "Adress to run" asks WHERE to store the depacker-entry word.
+
+run_clr_loop		sta	post_depack_jump,x
+			dex
+			bpl	run_clr_loop
+			inc	run_addr_size
+			lda	#$12			; select 18th message: "Adress to run"
+			ldx	#init_seg_addr
+			ldy	#init_seg_size
+			jsr	input_address
+			clc
+			lda	init_seg_addr+0
+			sta	init_seg_str+0
+			adc	#$01
+			sta	init_seg_end+0
+			lda	init_seg_addr+1
+			sta	init_seg_str+1
+			adc	#$00
+			sta	init_seg_end+1
+			lda	#$68			; "PLA" mnemonic
+			sta	dpck_done+0		; store in depacker body
+			sta	dpck_done+1
+			lda	#$60			; "RTS" mnemonic
+			sta	dpck_done+2		; store in depacker body
+			lda	#$14			; select 20th message: "Run after depack ?[Y/N] "
+			jsr	yes_or_no		; ... and ask user for decision.
+			bcc	second_pass		; no! so go directly to second pass!
+			lda	#$4C			; "JMP" mnemonic code
+			sta	dpck_done		; store in depacker body
+			lda	#$15			; print 21st message: "Where to jump?"
+			ldx	#post_depack_jump
+			ldy	#run_addr_size
+			jsr	input_address
+			lda	post_depack_jump+0	; load LO-byte of post-depack JMP target for patching below
+			sta	dpck_done+1
+			lda	post_depack_jump+1
+			sta	dpck_done+2
+
+; ----------------------------------------------------------------------------
+; $2626 PASS 2: reopen the intermediate file. OPEN status is not checked
+; here. Convert packed_block_size into pass2_end_ptr=$2B00+count in SAME bytes.
+; Write destination and TRUE length, read k/first literal, reserve control byte.
+; No new match search: token meanings remain unchanged.
+
+second_pass		jsr	print_EOL
+			lda	#$0A			; print out the 10th message: "Second pass. Wait."
+			jsr	print_msg
+			lda	#$04			; open for read
+			jsr	CIO_open_ch1
+			clc				; convert byte COUNT to buffer END address: add data_buffer
+			lda	packed_block_size+0
+			adc	<data_buffer
+			sta	pass2_end_ptr+0		; Low byte becomes an address; high is still size.
+			lda	packed_block_size+1
+			adc	>data_buffer
+			sta	pass2_end_ptr+1		; The word now holds the exclusive output end.
+			lda	#$80			; init input-bit sentinel and output-bit mask to $80
+			sta	pass2_bit_buffer
+			sta	pass2_bit_mask
+			lda	<data_buffer
+			sta	pass2_dst_ptr+0
+			lda	>data_buffer
+			sta	pass2_dst_ptr+1
+			ldx	#$00
+			lda	depa_adr+0
+			jsr	dst_put_byte
+			lda	depa_adr+1
+			jsr	dst_put_byte
+			lda	true_input_length+0
+			jsr	dst_put_byte
+			lda	true_input_length+1
+			jsr	dst_put_byte
+			jsr	get_8bit
+			sta	pass2_offset_bits
+			jsr	dst_put_byte
+			jsr	get_8bit
+			jsr	dst_put_byte
+			jsr	dst_rsvr_byte		; reserve 1-byte for bit-buffer in data stream
+
+; ----------------------------------------------------------------------------
+; Read one token flag from contiguous bitstream and append it to the
+; current reserved control byte. Full-byte values go directly at pass2_dst_ptr.
+
+nd_pass_loop		jsr	get_1bit		; get one bit from packed stream
+			jsr	dst_put_bit_A
+			bne	nd_lz77_seq
+			jsr	get_8bit
+			jsr	dst_put_byte
+			bcc	nd_pass_loop
+
+; ----------------------------------------------------------------------------
+; Copy the variable length PREFIX. Y counts at most three pairs; no
+; expanded data is produced. Extended length stays a full byte.
+
+nd_lz77_seq		ldy	#$02			; length-code state: the first zero bit denotes a 2-byte sequence
+			jsr	get_1bit		; get 1-bit from input stream
+			jsr	dst_put_bit_A
+			beq	nd_offset_now
+			iny
+nd_decode_len		jsr	get_2bit
+			jsr	dst_put_2bit
+			cmp	#$03
+			bcc	nd_offset_now
+			dey
+			bne	nd_decode_len
+			jsr	get_8bit
+			jsr	dst_put_byte
+nd_offset_now		jsr	get_8bit
+			jsr	dst_put_byte
+			ldx	pass2_offset_bits
+			beq	no_offset_bits
+			jsr	get_xbit
+			jsr	dst_put_offset
+no_offset_bits		jmp	nd_pass_loop
+get_8bit		ldx	#$06
+get_2bit		inx
+get_1bit		inx
+
+; ----------------------------------------------------------------------------
+; Input bit reader. Sentinel reload is (byte<<1)|1; old bit7 enters C.
+; CIO EOF returns an artificial zero byte, NOT termination. Other errors
+; restart main. OUT A=value, X=0, C=0, Z reflects A (ORA #0).
+
+get_xbit		lda	#$00
+get_bit_loop		asl	pass2_bit_buffer
+			bne	get_next
+			sta	pass2_io_saved_a
+			stx	pass2_io_saved_x
+			sty	pass2_io_saved_y
+			ldx	#$10			; select CIO channel #1
+			lda	#$07			; "get" command
+			sta	$0352			; write to ICCMD of channel #1
+			lda	#$00
+			sta	$0358			; write to ICBUFL of channel #1
+			sta	$0359			; write to ICBUFH of channel #1
+			jsr	$E456			; call system CIO routine
+			bpl	cio_get_OK		; check for errors
+			lda	#$00			; when EoF return zero
+			cpy	#$88			; check if EoF detected
+			beq	cio_get_OK
+			jmp	CIO_error
+cio_get_OK		sec
+			rol	@
+			sta	pass2_bit_buffer
+			ldy	pass2_io_saved_y	; restore Y reg.
+			ldx	pass2_io_saved_x	; restore X reg.
+			lda	pass2_io_saved_a	; restore A reg.
+get_next		rol	@
+			dex
+			bne	get_bit_loop
+			ora	#$00			; update flags in CPU status register
+			clc				; clear carry bit
+			rts				; return
+
+; ----------------------------------------------------------------------------
+; Write full byte, preserve A and flags, increment cursor. Completion
+; is tested ONLY here against saved byte-count limit; a control-byte reserve
+; can move cursor across the limit before this test. JMP finalizer abandons
+; local stack frames; main eventually restores S=$FF.
+
+dst_put_byte		php				; save status register
+			pha				; save A reg.
+			sta	(pass2_dst_ptr,x)	; store byte @ destination memory location
+			sta	$D01A			; write value into COLBACK register
+			inc	pass2_dst_ptr+0		; increment destination pointer
+			bne	*+4
+			inc	pass2_dst_ptr+1
+			lda	pass2_dst_ptr+0		; check for end of packed data
+			cmp	pass2_end_ptr+0
+			lda	pass2_dst_ptr+1
+			sbc	pass2_end_ptr+1
+			bcc	dst_put_return
+			jmp	finish_2nd_pass
+
+; ----------------------------------------------------------------------------
+; Use Z (from decoded A) to select the bit; SEC/BNE does not recompute
+; Z. Preserve caller A and flags, so the caller can branch on the same value.
+
+dst_put_bit_A		php				; push status register on stack
+			pha				; push A reg. on stack
+			sec				; set carry (assume bit value is "1")
+			bne	*+3			; Z=0 means bit 1 (callers set Z from A=0/1)
+			clc				; clr carry (bit value is "0")
+			jmp	dst_put_bit
+dst_put_bit_C		php
+			pha
+
+; ----------------------------------------------------------------------------
+; Output control-byte writer. Reserve a new byte only when another bit
+; is requested after eight bits. ROL writes MSB-first after all eight shifts.
+; Reserved RAM is not initially cleared; all used bits are shifted into place.
+
+dst_put_bit		lda	pass2_bit_mask
+			bne	dst_rol_adr
+			lda	#$80
+			sta	pass2_bit_mask
+			jsr	dst_rsvr_byte		; reserve next byte for bit-buffer in data stream
+dst_rol_adr		rol	$FFFF
+			lsr	pass2_bit_mask
+dst_put_return		pla				; restore A reg.
+			plp				; restore status reg.
+			rts				; return
+
+; ----------------------------------------------------------------------------
+; Append low two bits of A in MSB-first order, preserving A/status.
+
+dst_put_2bit		php
+			pha
+			lsr	@
+			ror	@
+			jsr	dst_put_bit_C
+			asl	@
+			jsr	dst_put_bit_C
+			jmp	dst_put_return
+
+; ----------------------------------------------------------------------------
+; Append k high-distance bits, preserving A and restoring X=0.
+; The caller skips this entry entirely for k=0.
+
+dst_put_offset		pha				; push A reg
+			stx	pass2_offset_saved_x	; store X reg.
+			ldx	pass2_offset_bits	; load k, the additional distance-bit count, into X
+dst_off_loop1		asl	@			; shift-up the upper offset bits
+			inx
+			cpx	#$08
+			bne	dst_off_loop1
+			ldx	pass2_offset_bits
+dst_off_loop2		asl	@			; shift next high distance bit into carry for output
+			jsr	dst_put_bit_C
+			dex
+			bne	dst_off_loop2
+			ldx	pass2_offset_saved_x	; restore X reg.
+			pla				; restore A reg.
+			rts				; return
+
+; ----------------------------------------------------------------------------
+; Remember current output location in ROL abs operand, advance cursor.
+; No initialization of reserved byte and NO end check in this helper.
+
+dst_rsvr_byte		lda	pass2_dst_ptr+0
+			sta	dst_rol_adr+1
+			lda	pass2_dst_ptr+1
+			sta	dst_rol_adr+2
+			inc	pass2_dst_ptr+0
+			bne	*+4
+			inc	pass2_dst_ptr+1
+			rts
+
+; ----------------------------------------------------------------------------
+; If mask != $80, append EIGHT zero bits, possibly reserving an extra
+; byte beyond the saved region. Saved count remains pass1_bytes+4. Padding
+; after meaningful tokens is retained; depacker stops at original output size.
+
+finish_2nd_pass		lda	pass2_bit_mask
+			cmp	#$80
+			beq	bit_buff_void
+			ldx	#$08			; send eight zero bits to finish the pending control byte
+bit_fill_loop		lda	#$00
+			jsr	dst_put_bit_A
+			dex
+			bne	bit_fill_loop
+
+; ----------------------------------------------------------------------------
+; Close intermediate file, reopen same name for write. OPEN status is
+; not checked immediately. bit6=write XEX header; bit7=append stub/vector.
+; Stale bit6 after first answer N can select an old header.
+
+bit_buff_void		jsr	CIO_close_1_2
+			lda	#$08			; open for write
+			jsr	CIO_open_ch1
+			bit	cfg_flags		; check user flags
+			bvc	raw_data_only
+			bpl	no_depacker
+			lda	file_seg_str+0
+			sta	pck_adr_lo+1
+			lda	file_seg_str+1
+			sta	pck_adr_hi+1
+			clc
+			lda	blk_adr_tab+6
+			adc	<data_buffer
+			sta	a:rel_dst_ptr+0		; Staging write address, not relocated runtime address.
+			lda	blk_adr_tab+7
+			adc	>data_buffer
+			sta	a:rel_dst_ptr+1
+			clc
+			lda	file_seg_end+0
+			sta	depacker_entry_word+0	; Temporarily inclusive stream end; increment below -> depacker entry.
+			adc	#$01
+			pha
+			lda	file_seg_end+1
+			sta	depacker_entry_word+1
+			adc	#$00
+			tax
+			pla
+			jsr	relocate		; relocate depacker
+			sec
+			lda	a:rel_dst_ptr+0
+			sbc	<data_buffer
+			sta	blk_adr_tab+6
+			tax				; store lo-byte of segment length in X reg.
+			lda	a:rel_dst_ptr+1
+			sbc	>data_buffer
+			sta	blk_adr_tab+7
+			tay				; store hi-byte of segment length in Y reg.
+			clc
+			txa
+			adc	file_seg_str+0
+			sta	file_seg_end+0
+			tya
+			adc	file_seg_str+1
+			sta	file_seg_end+1
+			lda	file_seg_end+0
+			bne	*+5
+			dec	file_seg_end+1
+			dec	file_seg_end+0
+			inc	depacker_entry_word+0	; Payload of vector segment becomes relocated depacker entry.
+			bne	*+5
+			inc	depacker_entry_word+1
+
+; ----------------------------------------------------------------------------
+; Write six-byte XEX header. If included, stub was appended immediately
+; after compressed block and file end extended to include all 204 bytes.
+
+no_depacker		ldy	#$02			; write out the "file header $FF,$FF,<start_adr>,<end_adr>"
+			jsr	block_write
+			bpl	*+5			; all ok!
+			jmp	CIO_error		; call CIO error procedure
+
+; ----------------------------------------------------------------------------
+; Write exactly descriptor-1 count bytes from $2B00. Even RAW output
+; contains the five-byte destination/length/k header and first literal.
+
+raw_data_only		ldy	#$01			; write out the "data buffer"
+			jsr	block_write
+			bpl	*+5
+			jmp	CIO_error		; call CIO error procedure
+
+; ----------------------------------------------------------------------------
+; With bit7, append the six-byte vector segment; its payload is the
+; relocated stub entry. This final write has no explicit error branch.
+
+maybe_write_vector	bit	cfg_flags		; check depacker "presence" flag
+			bpl	no_run_segment
+			ldy	#$04			; write out the "INIT/RUN" segment for depacker
+			jsr	block_write
+no_run_segment		jsr	CIO_close_1_2		; close #1 & #2 CIO channels
+			jsr	prs_any_key		; wait for any key...
+			jmp	main			; ... and restart program!
+
+; ----------------------------------------------------------------------------
+; Print a zero-terminated prompt via CIO PUT BYTES with calculated length.
+
+msg_print_Z		asl	@			; msg. number in A reg., multiply by 2 to get the index
+			tay				; move to Y reg. (will be used as an index register)
+			lda	msg_addr+0,y		; get LO-byte of message address from table
+			sta	$0344			; set LO-byte of the CIO buffer address
+			sta	text_ptr+0
+			lda	msg_addr+1,y		; get HI-byte of message address from table
+			sta	$0345			; set HI-byte of the CIO buffer address
+			sta	text_ptr+1
+			ldy	#$FF			; initial Y reg. value (after first INY will be zero)
+msg_zloop		iny				; increment first (because INY changes the CPU status reg.)
+			lda	(text_ptr),y		; load the current char of message into A reg.
+			bne	msg_zloop		; repeat until zero is detected
+			tya				; Y reg. now holds the message length
+			sta	$0348			; store in CIO buffer length variable (LO-byte)
+			ldx	#$00			; clear the CIO buffer length variable (HI-byte)
+			stx	$0349
+			lda	#$0B			; set the CIO "PUT" command
+			sta	$0342			; ... in the ICCOM
+			jmp	$E456			; call the CIO main routine
+
+; ----------------------------------------------------------------------------
+; Print Y as a visual suggestion, but RETURN does not accept it. Only
+; uppercase Y/N are accepted. OUT C=1 for Y, C=0 for N; PHP/PLP preserve
+; that result across echo and newline CIO calls.
+
+yes_or_no		jsr	msg_print_Z
+			ldy	#'Y'
+			jsr	CIO_putchar_E
+			ldy	#$1E			; backspace
+			jsr	CIO_putchar_E
+loop_YN			jsr	OS_GET_KEY_IGN
+			cmp	#'Y'
+			beq	ans_OK
+			cmp	#'N'
+			bne	loop_YN
+			clc
+ans_OK			php
+			tay
+			jsr	CIO_putchar_E
+			jsr	print_EOL
+			plp
+			rts
+
+; ----------------------------------------------------------------------------
+; IN A=message, X=ZP location of editable word, Y=ZP location of length.
+; Display inclusive range [address,address+length-1]. Enter four uppercase hex
+; characters; RETURN on an empty line accepts. No range or collision checks.
+; Each nonempty entry updates value and asks again for final acceptance.
+
+input_address		stx	ui_field_zp		; remember X: zero-page address of the word being edited
+			ldx	$0000,y			; get LO-byte of range length from the zero-page word selected by Y
+			stx	ui_range_length+0
+			ldx	$0001,y			; get HI-byte of range length from the zero-page word selected by Y
+			stx	ui_range_length+1
+			jsr	print_msg		; print message (number of message is in A reg. and it is passed to this procedure as parameter)
+			jsr	cmd_line_swap
+input_loop		lda	<msg0c			; load the address of the 12th message: "Actual adress is $xxxx-$yyyy."
+			sta	text_ptr+0
+			lda	>msg0c
+			sta	text_ptr+1
+			ldx	ui_field_zp		; restore X from ui_field_zp: index of the edited word
+			ldy	#$12			; Y=$12: first hex digit after '$' in the displayed address range
+			lda	$0001,x			; load HI-byte into A reg.
+			jsr	print_hex		; print it out
+			lda	$0000,x			; load LO-byte into A reg.
+			jsr	print_hex		; print it out
+			iny				; advance Y past '-' in message 12
+			iny				; advance Y past '$' in message 12
+			clc
+			lda	$0000,x			; get lo-byte of default/input value
+			adc	ui_range_length+0	; add lo-byte of data length
+			sta	ui_range_end+0		; store lo-byte
+			lda	$0001,x			; get hi-byte of default/input value
+			adc	ui_range_length+1	; add hi-byte of data length
+			sta	ui_range_end+1
+			lda	ui_range_end+0		; decrement end-address by 1
+			bne	*+4
+			dec	ui_range_end+1
+			dec	ui_range_end+0
+			lda	ui_range_end+1
+			sta	ui_result_end+1
+			jsr	print_hex
+			lda	ui_range_end+0
+			sta	ui_result_end+0
+			jsr	print_hex
+cnv_error		lda	#$0C			; print out the 12th message: "Actual adress is $xxxx-$yyyy."
+			jsr	print_msg
+			lda	#$0D			; print out the 13th message: "Please type a new adress"
+			jsr	msg_print_Z
+			ldx	#$00
+			jsr	CIO_inputX
+			lda	cmd_line		; check the cmd line..
+			eor	#$9B			; for EoL char...
+			beq	input_accept		; when EOL found then accept input or defaults
+			sta	ui_hex_value+0		; initial value = cmd_line[0] XOR $9B; all old bits shift out
+			sta	ui_hex_value+1		; initial value does not matter after four nibble shifts
+			ldy	#$03			; conversion loop counter (4 hex digits)
+
+; ----------------------------------------------------------------------------
+; Read exactly four characters in reverse. Existing accumulator bits are
+; shifted out after 16 shifts: no LDA #0 is needed. BUG: validation accepts
+; the punctuation gap between 9 and A; :;<= becomes $3456. Extra input beyond
+; four characters is not validated as part of this numeric conversion.
+
+cnv_loop		ldx	#$04			; shift loop counter (16-bit accumulator >> 4)
+shift_loop		lsr	ui_hex_value+1
+			ror	ui_hex_value+0
+			dex
+			bne	shift_loop
+			lda	cmd_line,y
+			cmp	#'0'
+			bcc	cnv_error
+			cmp	#'G'
+			bcs	cnv_error
+			sec
+			sbc	#'0'
+			cmp	#$0A			; check if <10
+			bcc	*+4
+			sbc	#$07			; subtract 7 with C=1: 'A'..'F' -> 10..15; punctuation also passes
+			asl	@			; shift to upper nibble
+			asl	@
+			asl	@
+			asl	@
+			ora	ui_hex_value+1		; do the bit-wise OR, to merge with the previous nibble
+			sta	ui_hex_value+1		; and store the result
+			dey
+			bpl	cnv_loop
+			ldx	ui_field_zp
+			lda	ui_hex_value+0
+			sta	$0000,x
+			lda	ui_hex_value+1
+			sta	$0001,x
+			jmp	input_loop
+input_accept		jmp	cmd_line_swap
+
+; ----------------------------------------------------------------------------
+; Swap $0400..$041F with $0420..$043F to preserve filename during
+; address entry. This is only 32 bytes although the input routine requests 40.
+
+cmd_line_swap		ldy	#$1F			; swap loop counter
+swap_loop		lda	cmd_line+$00,y
+			pha
+			lda	cmd_line+$20,y
+			sta	cmd_line+$00,y
+			pla
+			sta	cmd_line+$20,y
+			dey
+			bpl	swap_loop
+			rts
+
+; ----------------------------------------------------------------------------
+; $2911-$29DC: EXACT 204-byte exported fast depacker template.
+; First two immediate operands are patched to packed-stream runtime address.
+; Writable code, D=0 and valid nonwrapping memory ranges are required.
+; Header: destination LE16, true length LE16, k, first literal.
+; No bounds, distance, checksum or overlap validation; ZP/registers clobbered.
+
+depacker_start		equ	*
+pck_adr_lo		ldy	#$FF
+pck_adr_hi		ldx	#$FF
+			sty	dpck_get_byte+1
+			stx	dpck_get_byte+2
+			lda	#$80
+			sta	dpck_bit_buffer
+			ldx	#$00
+			jsr	dpck_get_byte
+			sta	dpck_dst_ptr+0
+			jsr	dpck_get_byte
+			sta	dpck_dst_ptr+1
+			jsr	dpck_get_byte
+			clc
+			adc	dpck_dst_ptr+0
+			sta	dpck_end_lo+1
+			jsr	dpck_get_byte
+			adc	dpck_dst_ptr+1
+			sta	dpck_end_hi+1
+			jsr	dpck_get_byte
+			sta	dpck_offset+1
+			bne	dpck_non_packed		; acts as JMP here: Z comes from pointer INC, not k; first byte is literal
+
+; ----------------------------------------------------------------------------
+; 0=literal, 1=match. First byte is entered without reading a flag.
+; At initial BNE, Z comes from get_byte pointer INC, NOT k: works for k=0
+; while the stream pointer does not wrap $FFFF->$0000.
+
+dpck_loop		jsr	dpck_get_1bit
+			bne	dpck_packed
+dpck_non_packed		jsr	dpck_get_byte
+			jsr	dpck_put_byte
+			bcc	dpck_loop
+
+; ----------------------------------------------------------------------------
+; Unrolled length tree: first 0 -> 2, first 1 -> read a pair.
+; At bases 3,6,9: pairs 00/01/10 are leaves; 11 enters the next group.
+; The third 11 escapes to a full length byte. See docs/FORMAT.md for the tree.
+; get-bits returns C=0 for supported field widths, enabling ADC constants
+; without CLC. Extended byte 0 would copy 256; encoder never emits it.
+
+dpck_packed		jsr	dpck_get_1bit
+			lsr	@
+			lda	#$02
+			bcc	dpck_seq_fin
+			jsr	dpck_get_2bit
+			adc	#$03			; First pair: 00/01/10 -> 3/4/5; 11 -> continuation value 6.
+			cmp	#$06
+			bcc	dpck_seq_fin
+			jsr	dpck_get_2bit
+			adc	#$06			; Second pair: 6/7/8 or continuation value 9.
+			cmp	#$09
+			bcc	dpck_seq_fin
+			jsr	dpck_get_2bit
+			adc	#$09			; Third pair: 9/10/11 or escape value 12.
+			cmp	#$0C
+			bcc	dpck_seq_fin
+			jsr	dpck_get_byte		; Escaped length replaces 12; it is not added to it.
+
+; ----------------------------------------------------------------------------
+; Patch CPY #length, fetch low distance and optional k high bits.
+
+dpck_seq_fin		sta	dpck_seq_len+1
+			jsr	dpck_get_byte
+			sta	dpck_match_distance+0
+dpck_offset		lda	#$00			; k (additional distance-bit count), patched into this immediate operand
+			tax
+			beq	dpck_8bit_off		; k=0: distance has only the low eight bits
+			jsr	dpck_get_xbit		; get HI-bits of offset value
+
+; ----------------------------------------------------------------------------
+; Compute match source = current destination - distance. Distance must
+; be positive and reference already reconstructed history; not checked here.
+
+dpck_8bit_off		sta	dpck_match_distance+1
+			sec
+			lda	dpck_dst_ptr+0
+			sbc	dpck_match_distance+0
+			sta	dpck_match_ptr+0	; Low byte: distance becomes match source address.
+			lda	dpck_dst_ptr+1
+			sbc	dpck_match_distance+1
+			sta	dpck_match_ptr+1	; The word now points to bytes to copy.
+			ldy	#$00
+
+; ----------------------------------------------------------------------------
+; Forward copy supports overlap: distance 1 expands a run. put_byte
+; may terminate the entire depacker in the middle of this match.
+
+dpck_seq_loop		lda	(dpck_match_ptr),y
+			jsr	dpck_put_byte
+			iny
+dpck_seq_len		cpy	#$00
+			bne	dpck_seq_loop
+			beq	dpck_loop		; BEQ acts as JMP!
+dpck_get_2bit		inx
+dpck_get_1bit		inx
+
+; ----------------------------------------------------------------------------
+; X=bit count, A=result, X=0 on return; Y preserved. $84 is a shifted
+; bit buffer with sentinel 1. Reload via ROL consumes first bit immediately.
+; ORA #0 makes Z reflect the returned value; C is not explicitly cleared.
+
+dpck_get_xbit		lda	#$00
+dpck_get_loop		asl	dpck_bit_buffer
+			bne	dpck_bits_left
+			pha
+			jsr	dpck_get_byte
+			rol	@			; sentinel in carry is 1; buffer becomes (input_byte << 1) | 1
+			sta	dpck_bit_buffer
+			pla
+dpck_bits_left		rol	@
+			dex
+			bne	dpck_get_loop
+			ora	#$00
+			rts
+
+; ----------------------------------------------------------------------------
+; Store with X=0 and advance destination. Unsigned compare against
+; self-modified exclusive end; wrapping end is unsupported. A zero length
+; still writes one literal before testing. No $D01A write in this variant.
+
+dpck_put_byte		sta	(dpck_dst_ptr,x)
+			inc	dpck_dst_ptr+0
+			bne	*+4
+			inc	dpck_dst_ptr+1
+			lda	dpck_dst_ptr+0
+dpck_end_lo		cmp	#$00
+			lda	dpck_dst_ptr+1
+dpck_end_hi		sbc	#$00
+			bcs	dpck_done
+			rts
+
+; ----------------------------------------------------------------------------
+; Default PLA/PLA drops return address of JSR put_byte; RTS returns to
+; the caller of the depacker. UI can replace all three bytes with JMP target.
+; That JMP does not unwind the stack; target must take ownership of execution.
+
+dpck_done		pla
+			pla
+			rts
+
+; ----------------------------------------------------------------------------
+; Self-modifying byte reader, preserves X/Y/C, but Z/N come from INC
+; of its operand. Input address must not wrap. Literal bytes need no bit loop.
+
+dpck_get_byte		lda	$FFFF
+			inc	dpck_get_byte+1
+			bne	*+5
+			inc	dpck_get_byte+2
+			rts
+depacker_end		equ	*
+
+; ----------------------------------------------------------------------------
+; $29DD. IN A/X=runtime low/high, rel_dst_ptr=staging destination.
+; Copy template by instruction lengths. Relocate JSR/absolute operands only
+; when their value lies in [$2911,$29DD). Branch displacements stay unchanged.
+; JMP is always copied without address adjustment (user jump target).
+; This classifier is specialized to the actual template, not arbitrary 6502.
+
+relocate		sta	rel_runtime_addr+0
+			stx	rel_runtime_addr+1
+			lda	<depacker_start
+			sta	rel_src_ptr+0
+			lda	>depacker_start
+			sta	rel_src_ptr+1
+			sec				; calculate relocation delta = runtime address - template address
+			lda	rel_runtime_addr+0
+			sbc	rel_src_ptr+0
+			sta	rel_adr_dif+0
+			lda	rel_runtime_addr+1
+			sbc	rel_src_ptr+1
+			sta	rel_adr_dif+1
+rel_loop		ldy	#$00
+			lda	rel_src_ptr+0
+			cmp	<depacker_end
+			lda	rel_src_ptr+1
+			sbc	>depacker_end
+			bcc	*+3
+			rts
+			jsr	rel_add0
+			tax
+			cmp	#$20			; check for JSR
+			beq	rel_do_rel
+			cmp	#$4C			; check for JMP
+			beq	rel_not_touch
+			cmp	#$40			; check for RTI
+			beq	rel_loop
+			cmp	#$60			; check for RTS
+			beq	rel_loop
+			and	#$0D
+			cmp	#$08
+			beq	rel_loop
+			bcc	rel_next
+			txa
+			and	#$1F
+			cmp	#$09
+			beq	rel_next
+
+; ----------------------------------------------------------------------------
+; Test both bounds of the original template before adding relocation
+; delta. Self-modified absolute accesses to code operands are relocated too.
+
+rel_do_rel		lda	(rel_src_ptr),y
+			tax
+			iny
+			cmp	<depacker_start
+			lda	(rel_src_ptr),y
+			sbc	>depacker_start
+			bcc	rel_not_touch
+			lda	(rel_src_ptr),y
+			cpx	<depacker_end
+			sbc	>depacker_end
+			bcs	rel_not_touch
+			lda	rel_adr_dif+0
+			ldx	rel_adr_dif+1
+			bcc	rel_diff		; BCC is like JMP!
+
+; ----------------------------------------------------------------------------
+; Copy two operand bytes unchanged. In particular this handles final
+; JMP even if user target numerically lies inside the original template range.
+
+rel_not_touch		lda	#$00
+			tax
+rel_diff		ldy	#$00
+			jsr	rel_addX
+			txa
+			jsr	rel_addC
+			bne	rel_jmp			; acts as JMP for a nonwrapping staging buffer; Z comes from pointer INC
+rel_next		jsr	rel_add0
+rel_jmp			jmp	rel_loop
+
+; ----------------------------------------------------------------------------
+; Copy/add one byte, advance source and staging destination, preserve C
+; from ADC through INC so low/high relocation addition chains correctly.
+; The caller BNE relies on pointer-INC flags, not the copied byte value.
+
+rel_add0		lda	#$00
+rel_addX		clc
+rel_addC		adc	(rel_src_ptr),y
+			sta	(rel_dst_ptr),y
+			inc	rel_src_ptr+0
+			bne	*+4
+			inc	rel_src_ptr+1
+			inc	rel_dst_ptr+0
+			bne	*+4
+			inc	rel_dst_ptr+1
+			rts

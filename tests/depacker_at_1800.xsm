@@ -1,0 +1,4 @@
+; Test assembly. This file does not set an Atari run vector.
+
+			org	$1800
+			icl	'src/sote_depacker.xsm'

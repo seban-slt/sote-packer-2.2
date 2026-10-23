@@ -1,0 +1,163 @@
+; SoTe Packer 2.2 FAST depacker. Original code: Adam Bienias / SoTe / Slight.
+; Source preserved by Seban. Comments checked against the 6502 instructions.
+; This file preserves the 195-byte routine, including the color write.
+; It differs from the 204-byte routine that the original packer appends.
+;
+; Call: Y = low source address, X = high source address, JSR depack.
+; Set decimal mode to zero with CLD before the call.
+; The FAST header supplies the output address, output size and window.
+; Changes: A, X, Y, flags, dst/src/cnt/len and the COLBK register.
+; The code changes its own operands. Assemble it at its execution address
+; and keep it in RAM. The caller supplies ORG before this include file.
+; Reserve the stack and zero-page bytes. Keep the code, input and output
+; in separate memory areas unless you have checked a particular overlap.
+; The routine does not validate the input. See docs/USER_GUIDE.md.
+;
+; Layout: TAB = 8; label/opcode/operand/comment columns 1/25/33/57.
+
+dst			equ	$80			; Output pointer, 2 bytes.
+src			equ	$82			; Distance, then copy pointer (variable reused).
+cnt			equ	$84			; Control bits and a sentinel bit.
+len			equ	$85			; Copy length; zero means 256 bytes.
+
+; Set the input pointer in the byte reader. X stays zero between bit reads.
+; The initial sentinel forces a refill on the first request for a bit.
+
+depack			sty	get+1			; Save the low input address.
+			stx	get+2			; Save the high input address.
+			lda	#$80
+			sta	cnt			; Initialize the bit reader.
+			ldx	#$00
+
+; Read the destination address, low byte first.
+
+			jsr	get
+			sta	dst
+			jsr	get
+			sta	dst+1
+			jsr	get			; Read the low byte of the output size.
+
+; Calculate the exclusive end address. GET preserves carry.
+; A valid block has a nonzero size and an end address below $10000.
+
+			clc
+			adc	dst
+			sta	endl+1			; Set the low end-address operand.
+			jsr	get			; Read the high byte of the output size.
+			adc	dst+1
+			sta	endh+1			; Set the high end-address operand.
+
+; Read k, the number of distance bits above the low byte.
+; The first output byte is always a literal. It has no token flag.
+
+			jsr	get
+			sta	offset+1
+			jmp	f_unp
+
+loop			jsr	get_1bit		; Read a token flag.
+			bne	packed			; One selects a copy; zero selects a literal.
+
+f_unp			jsr	get			; Read a literal byte.
+			jsr	put			; Write it, or return to the caller at the end.
+			bcc	loop			; PUT returns here only with carry clear.
+
+; Decode the copy length. A zero bit means 2 bytes.
+; Read up to three pairs. A pair with value 3 continues to the next group.
+; Three pairs with value 3 select a full length byte. Byte zero means 256.
+
+packed			ldy	#$02
+			sty	len
+			jsr	get_1bit
+			beq	end_ofl
+			iny
+			sty	len			; Start the first group at length 3.
+lb_loop			jsr	get_2bit		; Returns 0..3 with carry clear.
+			pha				; Keep the pair for the continuation test.
+			adc	len
+			sta	len
+			pla
+			cmp	#$03
+			bcc	end_ofl			; Pairs 0, 1 and 2 finish the length.
+			dey
+			bne	lb_loop			; Try the next group, at most three groups.
+			jsr	get			; Read the full length byte.
+			sta	len
+
+; Read the distance: low byte, then k high bits.
+; With k=0, A is already zero and no high bits follow.
+
+end_ofl			jsr	get
+			sta	src
+offset			lda	#$ff			; Patched from the header: k=0..8.
+			tax
+			beq	*+5
+			jsr	get_Xbit
+			sta	src+1
+			sec				; Convert distance to a copy source address.
+			lda	dst
+			sbc	src
+			sta	src
+			lda	dst+1
+			sbc	src+1
+			sta	src+1
+
+; Copy forwards. A copy can read bytes that it has just produced.
+; The output pointer advances in PUT; the copy pointer stays fixed.
+
+			ldy	#$00
+cp_loop			lda	(src),y
+			jsr	put
+			iny
+			cpy	len			; Y wraps after 256 bytes if len is zero.
+			bne	cp_loop
+			beq	loop			; Always taken after the equal comparison.
+
+; Read one, two or X bits, most significant bit first.
+; X is zero at the one-bit and two-bit entry points. It returns to zero.
+; A contains the result; ORA restores its zero flag after DEX.
+
+get_2bit		inx
+get_1bit		inx
+get_Xbit		lda	#$00
+bit_loop		asl	cnt			; Move the next bit into carry.
+			bne	nzero
+			pha				; Preserve the partial result during a refill.
+			jsr	get
+			rol	@			; Insert sentinel 1; bit 7 goes into carry.
+			sta	cnt
+			pla
+nzero			rol	@			; Add the bit to the result.
+			dex
+			bne	bit_loop
+			ora	#$00
+			rts
+
+; Write one byte. X must be zero. Preserve the original color effect.
+
+put			sta	(dst,x)
+			sta	$d01a			; Write the same value to COLBK.
+			inc	dst
+			bne	*+4
+			inc	dst+1
+
+; Compare the output pointer with the exclusive end address.
+; At the end, discard the return address from JSR PUT. RTS then returns
+; to the caller of DEPACK. This can stop a copy before its stated length.
+
+			lda	dst
+endl			cmp	#$ff
+			lda	dst+1
+endh			sbc	#$ff
+			bcc	*+4
+			pla
+			pla
+			rts
+
+; Read a byte through a self-modified absolute address.
+; Preserve X, Y and carry. Advance the pointer across page boundaries.
+
+get			lda	$ffff
+			inc	get+1
+			bne	*+5
+			inc	get+2
+			rts
