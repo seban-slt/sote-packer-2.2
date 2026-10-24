@@ -1,0 +1,2 @@
+# XASM sources contain 6502 assembly code.
+*.xsm linguist-language=Assembly
